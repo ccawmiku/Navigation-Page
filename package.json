@@ -11,16 +11,16 @@
     "test": "node --experimental-strip-types --test tests/*.test.ts && vitest run --config vitest.config.ts"
   },
   "dependencies": {
-    "@lucide/vue": "^1.62.0",
+    "@lucide/vue": "^1.74.0",
     "grid-layout-plus": "^1.1.1",
-    "vue": "^3.5.44",
+    "vue": "^3.5.45",
     "vuedraggable": "^4.1.0"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "beta",
     "@types/node": "latest",
     "@vitejs/plugin-vue": "latest",
-    "@vue/test-utils": "^2.5.1",
+    "@vue/test-utils": "^2.6.0",
     "cf": "1.0.0-beta.23",
     "happy-dom": "^21.0.4",
     "typescript": "^6.0.3",
