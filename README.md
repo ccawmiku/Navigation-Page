@@ -3,7 +3,7 @@
 Vue 3 + Vite + Cloudflare Workers 构建的个人网站导航。界面参考 iCloud 首页，保留透明顶栏、网站图标卡片与「自定义」入口。
 
 - 单人使用，密码与 Turnstile 验证，30 天登录会话。
-- D1 保存网站、图标、排列顺序；切回页面时获取其他设备的更新。
+- 专用 SQLite Durable Object 保存网站、图标和排列顺序；切回页面时获取其他设备的更新。
 - 网站增删改、拖拽排序；编辑模式下也可使用 Alt + 左右方向键排序。
 - 自动读取公网网站标题与图标；完整 Lucide 图标库可搜索、选色。
 - 沿用原页 SM / MD / LG 三档容器；1165px 以下为 315px 卡片、四列 54px 图标，1165px 起为 660px 卡片、六列 70px 图标。容器切换点为 760px 和 1165px。
@@ -31,34 +31,34 @@ npm run dev
 
 在 `.dev.vars` 设置本地密码和随机会话密钥。开发模式使用 Cloudflare 官方 Turnstile 测试组件；生产构建使用真实组件，服务器始终调用 Siteverify，不存在跳过验证的登录入口。
 
-开发服务器启动后，通过控制台显示的 Local Explorer / D1 为本地数据库执行 `worker/schema.sql`。它只影响本地数据。Cloudflare CLI 的 `cf d1 raw --local` 和 Vite 开发服务器可能使用不同的持久化目录，应对准开发服务器绑定的数据库。
+本地 Durable Object 首次访问时会自动创建数据表。
 
 ```sh
 npm run build
 npm run check
 npm test
+npm run test:worker
 ```
 
 `cf build` 同时生成 Worker 绑定类型，之后进行 TypeScript 检查。
 
 ## 部署
 
-本项目使用 Cloudflare 官方 `cf` CLI 与 `cloudflare.config.ts`。配置中的 D1 ID、自定义域名、Turnstile sitekey 属于当前实例；部署独立实例时替换为自己的资源。
+本项目使用 Cloudflare 官方 `cf` CLI 与 `cloudflare.config.ts`。自定义域名和 Turnstile sitekey 属于当前实例。两个正式域名通过对象名 `personal-dashboard` 定位同一份导航配置。
 
-1. 创建 D1 数据库，在远程数据库执行 `worker/schema.sql`。
-2. 为目标域名创建 managed Turnstile 组件，更新配置中的公开 sitekey。
-3. 配置 `CLOUDFLARE_API_TOKEN` 和 `CLOUDFLARE_ACCOUNT_ID`，令牌需具有相应 Workers、D1 与域名操作权限。
-4. 在仓库外准备受保护的 JSON secrets 文件，包含 `ADMIN_PASSWORD`、`SESSION_SECRET`、`TURNSTILE_SECRET`。额度卡片另需 `CF_ANALYTICS_TOKEN`、`CF_ANALYTICS_ACCOUNT_ID`；优先使用限定单账号的 Analytics Read 令牌。不要提交此文件。
-5. 执行：
+1. 为目标域名创建 managed Turnstile 组件，更新配置中的公开 sitekey。
+2. 配置 `CLOUDFLARE_API_TOKEN` 和 `CLOUDFLARE_ACCOUNT_ID`，令牌需具有相应 Workers 与域名操作权限。
+3. 在仓库外准备受保护的 JSON secrets 文件，包含 `ADMIN_PASSWORD`、`SESSION_SECRET`、`TURNSTILE_SECRET`。额度卡片另需 `CF_ANALYTICS_TOKEN`、`CF_ANALYTICS_ACCOUNT_ID`。优先使用限定单账号的 Analytics Read 令牌。
+4. 执行下列命令。首次部署会创建 `DashboardStore` 的 SQLite 命名空间。
 
 ```sh
 npx cf deploy --dry-run
 npx cf deploy --secrets-file /absolute/private/path/secrets.json
 ```
 
-部署会绑定配置中的自定义域名，`workers.dev` 与版本预览地址默认关闭。网站数据通过登录后的接口写入 D1，仓库不包含个人网站清单。
+部署会绑定配置中的自定义域名，`workers.dev` 与版本预览地址默认关闭。网站数据通过登录后的接口写入 DO。
 
-初始密码仅用于首次配置。通过头像菜单修改密码后，数据库中的 PBKDF2 派生值覆盖初始密码，并撤销旧会话。丢失修改后的密码时，可由账户所有者删除 D1 `settings` 中的 `password` 记录、更新 `epoch` 值，恢复为 Worker 的 `ADMIN_PASSWORD`；此操作会撤销已有会话。
+初始密码仅用于首次配置。通过头像菜单修改密码后，DO 保存新的 PBKDF2 派生值并撤销旧会话。忘记改后的密码时，可由账户所有者维护 `personal-dashboard` 对象中的 `settings` 表，删除 `password` 并更新 `epoch` 值，以恢复 Worker 的 `ADMIN_PASSWORD` 并撤销已有会话。
 
 ## 内网网站
 

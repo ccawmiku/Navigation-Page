@@ -2,19 +2,19 @@ import { env } from 'cloudflare:workers'
 import { emptyDashboard, validateDashboard, websiteUrl, withQuotaSection } from '../shared/dashboard'
 import { hashPassword, sameSecret, signSession, verifySession } from './auth'
 import { accountUsage } from './account-usage'
+export { DashboardStore } from './dashboard-store'
 
 const json = (data: unknown, status = 200, headers: HeadersInit = {}) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store', ...headers } })
 const cookieName = '__Host-home-nav'
-const getEpoch = async () => (await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind('epoch').first<{ value: string }>())?.value || '0'
+const dashboardStore = () => env.DASHBOARD_STORE.getByName('personal-dashboard')
 const isLocal = (request: Request) => ['localhost', '127.0.0.1'].includes(new URL(request.url).hostname)
 async function authenticated(request: Request): Promise<boolean> {
   const token = request.headers.get('Cookie')?.split(';').map(v => v.trim()).find(v => v.startsWith(cookieName + '='))?.slice(cookieName.length + 1)
-  return !!token && verifySession(token, env.SESSION_SECRET, await getEpoch())
+  return !!token && verifySession(token, env.SESSION_SECRET, await dashboardStore().getEpoch())
 }
-async function passwordMatches(password: string): Promise<boolean> {
-  const saved = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind('password').first<{ value: string }>()
+async function passwordMatches(password: string, saved: string | undefined): Promise<boolean> {
   if (!saved) return sameSecret(password, env.ADMIN_PASSWORD)
-  const { salt, hash } = JSON.parse(saved.value) as { salt: string; hash: string }
+  const { salt, hash } = JSON.parse(saved) as { salt: string; hash: string }
   return sameSecret(await hashPassword(password, salt), hash)
 }
 async function body(request: Request, limit = 1500000): Promise<unknown> {
@@ -32,14 +32,13 @@ async function login(request: Request): Promise<Response> {
   const ip = request.headers.get('CF-Connecting-IP') || 'local'
   const now = Math.floor(Date.now() / 1000)
   const attemptKey = ip + ':' + Math.floor(now / 900)
-  await env.DB.prepare('DELETE FROM login_attempts WHERE expires < ?').bind(now).run()
-  const attempts = await env.DB.prepare('INSERT INTO login_attempts (key,count,expires) VALUES (?,1,?) ON CONFLICT(key) DO UPDATE SET count=count+1 RETURNING count').bind(attemptKey, now + 900).first<{ count: number }>()
-  if (!attempts || attempts.count > 10) return json({ error: '尝试过多，请稍后再试' }, 429)
+  if (await dashboardStore().recordLoginAttempt(attemptKey, now) > 10) return json({ error: '尝试过多，请稍后再试' }, 429)
   const verify = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ secret: env.TURNSTILE_SECRET, response: input.token, remoteip: isLocal(request) ? undefined : ip }), signal: AbortSignal.timeout(12000) })
   const challenge = await verify.json() as { success: boolean; hostname?: string; action?: string }
   if (!challenge.success || (!isLocal(request) && (challenge.hostname !== new URL(request.url).hostname || challenge.action !== 'login'))) return json({ error: '验证未通过，请重试' }, 403)
-  if (!await passwordMatches(input.password)) return json({ error: '密码错误' }, 401)
-  const token = await signSession(env.SESSION_SECRET, await getEpoch())
+  const loginState = await dashboardStore().getLoginState()
+  if (!await passwordMatches(input.password, loginState.password)) return json({ error: '密码错误' }, 401)
+  const token = await signSession(env.SESSION_SECRET, loginState.epoch)
   return json({ ok: true }, 200, { 'Set-Cookie': `${cookieName}=${token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=2592000` })
 }
 async function handle(request: Request): Promise<Response> {
@@ -52,28 +51,25 @@ async function handle(request: Request): Promise<Response> {
   if (url.pathname === '/api/account-usage' && request.method === 'GET') return json(await accountUsage(env, url.searchParams.get('refresh') === '1'))
   if (url.pathname === '/api/logout' && request.method === 'POST') return json({ ok: true }, 200, { 'Set-Cookie': `${cookieName}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0` })
   if (url.pathname === '/api/dashboard' && request.method === 'GET') {
-    const row = await env.DB.prepare('SELECT data,revision FROM dashboard WHERE id=1').first<{ data: string; revision: number }>()
+    const row = await dashboardStore().readDashboard()
     return json({ dashboard: withQuotaSection(row ? validateDashboard(JSON.parse(row.data)) : emptyDashboard()), revision: row?.revision || 0 })
   }
   if (url.pathname === '/api/dashboard' && request.method === 'PUT') {
     const input = await body(request) as { dashboard: unknown; revision: number }
     const dashboard = validateDashboard(input.dashboard)
     if (!Number.isInteger(input.revision) || input.revision < 0) throw new Error('无效的版本号')
-    const saved = input.revision === 0
-      ? await env.DB.prepare('INSERT OR IGNORE INTO dashboard(id,data,revision) VALUES(1,?,1)').bind(JSON.stringify(dashboard)).run()
-      : await env.DB.prepare('UPDATE dashboard SET data=?,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE id=1 AND revision=?').bind(JSON.stringify(dashboard), input.revision).run()
-    if (!saved.meta.changes) return json({ error: '其他设备已修改配置，请重新加载后再编辑' }, 409)
-    return json({ revision: input.revision + 1 })
+    const revision = await dashboardStore().saveDashboard(JSON.stringify(dashboard), input.revision)
+    if (revision === null) return json({ error: '其他设备已修改配置，请重新加载后再编辑' }, 409)
+    return json({ revision })
   }
   if (url.pathname === '/api/password' && request.method === 'POST') {
     const input = await body(request, 2000) as { current: string; password: string }
     if (typeof input.current !== 'string' || typeof input.password !== 'string' || input.current.length > 256 || input.password.length < 8 || input.password.length > 128) throw new Error('新密码应为 8–128 个字符')
-    if (!await passwordMatches(input.current)) return json({ error: '当前密码错误' }, 400)
+    const loginState = await dashboardStore().getLoginState()
+    if (!await passwordMatches(input.current, loginState.password)) return json({ error: '当前密码错误' }, 400)
     const salt = crypto.randomUUID(); const hash = await hashPassword(input.password, salt)
-    await env.DB.batch([
-      env.DB.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind('password', JSON.stringify({ salt, hash })),
-      env.DB.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind('epoch', crypto.randomUUID()),
-    ])
+    if (!await dashboardStore().setPassword(loginState.epoch, JSON.stringify({ salt, hash }), crypto.randomUUID()))
+      return json({ error: '密码已修改，请重新登录' }, 409)
     return json({ ok: true }, 200, { 'Set-Cookie': `${cookieName}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0` })
   }
   if (url.pathname === '/api/metadata' && request.method === 'POST') {

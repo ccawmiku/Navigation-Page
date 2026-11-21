@@ -1,17 +1,24 @@
-import { bindings, defineConfig } from 'cf/config'
+import { bindings, defineConfig, defineWorker, exports } from 'cf/config'
+import * as entrypoint from './worker/index.ts' with { type: 'cf-worker' }
 
-export default defineConfig(({ mode }) => ({
-  worker: {
+export default defineConfig(({ mode }) => {
+  const worker = defineWorker({
     name: 'home-nav',
-    entrypoint: './worker/index.ts',
+    entrypoint,
     compatibilityDate: '2026-10-27',
     compatibilityFlags: ['nodejs_compat'],
     domains: ['index.onya.cc', 'index.yaemiko.lol'],
     workersDev: false,
     previewUrls: false,
+    exports: { DashboardStore: exports.durableObject({ storage: 'sqlite' }) },
+    assets: { notFoundHandling: 'single-page-application', runWorkerFirst: ['/api/*'] },
+    observability: { enabled: true, logs: { enabled: true }, traces: { enabled: true, headSamplingRate: 0.01 } },
+  })
+  return { worker: {
+    ...worker,
     env: {
       ASSETS: bindings.assets(),
-      DB: bindings.d1({ name: 'home-nav', id: 'bf1c9c30-2d7a-4f11-8f1f-0fe587026ff3' }),
+      DASHBOARD_STORE: bindings.durableObject({ worker, exportName: 'DashboardStore' }),
       ADMIN_PASSWORD: bindings.secret(),
       SESSION_SECRET: bindings.secret(),
       TURNSTILE_SECRET: bindings.secret(),
@@ -19,7 +26,5 @@ export default defineConfig(({ mode }) => ({
       CF_ANALYTICS_ACCOUNT_ID: bindings.secret(),
       TURNSTILE_SITE_KEY: bindings.text(mode === 'development' ? '1x00000000000000000000AA' : '0x4AAAAAAFoQuEqMCcs9svVR'),
     },
-    assets: { notFoundHandling: 'single-page-application', runWorkerFirst: ['/api/*'] },
-    observability: { enabled: true, logs: { enabled: true }, traces: { enabled: true, headSamplingRate: 0.01 } },
-  },
-}))
+  } }
+})
