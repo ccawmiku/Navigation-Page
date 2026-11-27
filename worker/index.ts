@@ -24,7 +24,11 @@ async function body(request: Request, limit = 1500000): Promise<unknown> {
   let size = 0; const chunks: Uint8Array[] = []
   while (true) { const { done, value } = await reader.read(); if (done) break; size += value.byteLength; if (size > limit) { await reader.cancel(); throw new Error('请求过大') }; chunks.push(value) }
   const bytes = new Uint8Array(size); let offset = 0; for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length }
-  return JSON.parse(new TextDecoder().decode(bytes))
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes))
+  } catch {
+    throw new Error('请求格式无效')
+  }
 }
 async function login(request: Request): Promise<Response> {
   const input = await body(request, 6000) as { password?: string; token?: string }
@@ -34,6 +38,7 @@ async function login(request: Request): Promise<Response> {
   const attemptKey = ip + ':' + Math.floor(now / 900)
   if (await dashboardStore().recordLoginAttempt(attemptKey, now) > 10) return json({ error: '尝试过多，请稍后再试' }, 429)
   const verify = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ secret: env.TURNSTILE_SECRET, response: input.token, remoteip: isLocal(request) ? undefined : ip }), signal: AbortSignal.timeout(12000) })
+  if (!verify.ok) { await verify.body?.cancel(); throw new Error('turnstile_unavailable') }
   const challenge = await verify.json() as { success: boolean; hostname?: string; action?: string }
   if (!challenge.success || (!isLocal(request) && (challenge.hostname !== new URL(request.url).hostname || challenge.action !== 'login'))) return json({ error: '验证未通过，请重试' }, 403)
   const loginState = await dashboardStore().getLoginState()
@@ -104,7 +109,7 @@ export default {
       secured.headers.set('Content-Security-Policy', "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: http:; connect-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
       return secured
     } catch (error) {
-      if (error instanceof SyntaxError || error instanceof TypeError || error instanceof Error && !('cause' in error) && /无效|名称|网址|图标|布局|密码|请求|最多|配置|栏目/.test(error.message)) return json({ error: error.message }, 400)
+      if (error instanceof Error && !('cause' in error) && /无效|名称|网址|图标|布局|密码|请求|最多|配置|栏目/.test(error.message)) return json({ error: error.message }, 400)
       console.error(JSON.stringify({ event: 'request_failed', path: new URL(request.url).pathname }))
       return json({ error: '暂时无法处理，请重试' }, 500)
     }

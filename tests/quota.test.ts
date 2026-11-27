@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { accountUsage, accountUsageSnapshot } from '../worker/account-usage.ts'
-import { productPeak, quotaPercent } from '../shared/account-usage.ts'
+import { productPeak, quotaNumber, quotaPercent } from '../shared/account-usage.ts'
 import { emptyDashboard, validateDashboard, withQuotaSection } from '../shared/dashboard.ts'
 import { dashboardGrid } from '../src/layout.ts'
 
@@ -106,4 +106,94 @@ test('upstream failures retain known data, back off, and never return credential
   assert.equal(JSON.stringify([stale, failure]).includes(env.CF_ANALYTICS_TOKEN), false)
   const unconfigured = await accountUsage({ ...env, CF_ANALYTICS_TOKEN: '' }, false, cache)
   assert.equal(unconfigured.status, 'unconfigured')
+})
+
+test('quotaNumber and quotaPercent format all units, magnitudes and null limits', () => {
+  assert.equal(quotaNumber(null, 'count'), '暂无数据')
+  assert.equal(quotaNumber(null, 'bytes'), '暂无数据')
+  assert.equal(quotaNumber(512, 'bytes'), '512 B')
+  assert.equal(quotaNumber(1536, 'bytes'), '1.5 kB')
+  assert.equal(quotaNumber(2500000, 'bytes'), '2.5 MB')
+  assert.equal(quotaNumber(5e9, 'bytes'), '5.00 GB')
+  assert.equal(quotaNumber(42, 'count'), '42')
+  assert.equal(quotaNumber(12.34, 'count'), '12.3')
+  assert.equal(quotaNumber(1500, 'count'), '1.5k')
+  assert.equal(quotaNumber(2500000, 'count'), '2.5m')
+  assert.equal(quotaNumber(13000, 'gbs'), '13.0k GB·s')
+  assert.equal(quotaNumber(3.45, 'ms'), '3.5 ms')
+
+  assert.equal(quotaPercent({ id: 'a', product: 'Workers', name: 'A', value: null, limit: 100, unit: 'count', period: 'day' }), null)
+  assert.equal(quotaPercent({ id: 'a', product: 'Workers', name: 'A', value: 10, limit: null, unit: 'count', period: 'day' }), null)
+  assert.equal(quotaPercent({ id: 'a', product: 'Workers', name: 'A', value: 10, limit: 0, unit: 'count', period: 'day' }), null)
+  assert.equal(quotaPercent({ id: 'a', product: 'Workers', name: 'A', value: 50, limit: 200, unit: 'count', period: 'day' }), 25)
+})
+
+test('withQuotaSection avoids ID collision and snapshot handles truncated storage samples', () => {
+  const custom = {
+    version: 1 as const,
+    sections: [{ id: 'cloudflare', type: 'websites' as const, x: 0, y: 0, w: 12, h: 1, sites: [] }],
+  }
+  const upgraded = withQuotaSection(custom)
+  assert.equal(upgraded.sections[1]!.id, 'cloudflare-quota')
+  assert.doesNotThrow(() => validateDashboard(upgraded))
+
+  const fullSamples = Array.from({ length: 1000 }, () => ({ max: { storedBytes: 10 } }))
+  const snapshot = accountUsageSnapshot({
+    doStorage: fullSamples,
+    d1Storage: [{ max: { databaseSizeBytes: -1 } }],
+    workers: [{ sum: { requests: Number.NaN, cpuTimeUs: 100 } }],
+  }, Date.UTC(2026, 10, 4, 3))
+  assert.equal(snapshot.metrics.find(m => m.id === 'do-storage')!.value, null)
+  assert.equal(snapshot.metrics.find(m => m.id === 'd1-storage')!.value, null)
+  assert.equal(snapshot.metrics.find(m => m.id === 'workers-requests')!.value, null)
+})
+
+test('accountUsage handles partial GraphQL errors, >1MB responses, cache failures and invalid account IDs', async t => {
+  const now = Date.UTC(2026, 10, 4, 3)
+  t.mock.method(Date, 'now', () => now)
+
+  // 非法 32 位 Account ID 视为未配置
+  const badId = await accountUsage({ CF_ANALYTICS_TOKEN: 'tok', CF_ANALYTICS_ACCOUNT_ID: 'short' }, false, cacheFixture())
+  assert.equal(badId.status, 'unconfigured')
+
+  // GraphQL 返回 errors 且有 account 数据时降级为 partial
+  t.mock.method(globalThis, 'fetch', async () => Response.json({
+    data: { viewer: { accounts: [raw()] } },
+    errors: [{ message: 'partial failure' }],
+  }))
+  const partial = await accountUsage(env, false, cacheFixture())
+  assert.equal(partial.status, 'partial')
+  assert.match(partial.message || '', /部分统计暂时不可用/)
+
+  // 超过 1MB 的响应体被 limitedText 截断拒绝并降级为 error
+  t.mock.method(globalThis, 'fetch', async () => new Response(new Uint8Array(1048577)))
+  const oversized = await accountUsage(env, false, cacheFixture())
+  assert.equal(oversized.status, 'error')
+
+  // 空 body 或 accounts 为空数组降级为 error
+  t.mock.method(globalThis, 'fetch', async () => new Response(null, { status: 200 }))
+  assert.equal((await accountUsage(env, false, cacheFixture())).status, 'error')
+  t.mock.method(globalThis, 'fetch', async () => Response.json({ data: { viewer: { accounts: [] } } }))
+  assert.equal((await accountUsage(env, false, cacheFixture())).status, 'error')
+
+  // caches.open 异常与 cache.match/put 异常均不影响正常返回
+  const originalCaches = Object.getOwnPropertyDescriptor(globalThis, 'caches')
+  Object.defineProperty(globalThis, 'caches', {
+    configurable: true,
+    value: { open: async () => { throw new Error('cache disabled') } },
+  })
+  t.after(() => {
+    if (originalCaches) Object.defineProperty(globalThis, 'caches', originalCaches)
+    else delete (globalThis as Record<string, unknown>).caches
+  })
+  t.mock.method(globalThis, 'fetch', async () => Response.json({ data: { viewer: { accounts: [raw()] } } }))
+  const noCacheRes = await accountUsage(env, false)
+  assert.equal(noCacheRes.status, 'ok')
+
+  const brokenCache = {
+    match: async () => { throw new Error('read failed') },
+    put: async () => { throw new Error('write failed') },
+  }
+  const brokenCacheRes = await accountUsage(env, false, brokenCache)
+  assert.equal(brokenCacheRes.status, 'ok')
 })

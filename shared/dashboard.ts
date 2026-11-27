@@ -18,7 +18,12 @@ export function withQuotaSection(dashboard: Dashboard): Dashboard {
 }
 
 export function websiteUrl(value: string): string {
-  const url = new URL(value)
+  let url: URL
+  try {
+    url = new URL(value)
+  } catch {
+    throw new Error('请输入有效的 HTTP 或 HTTPS 网址')
+  }
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || value.length > 2048) throw new Error('请输入有效的 HTTP 或 HTTPS 网址')
   return url.href
 }

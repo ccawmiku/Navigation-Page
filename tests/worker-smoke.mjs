@@ -1,10 +1,18 @@
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
+import { access, readFile } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 import { Miniflare, Response } from 'miniflare'
 
+const bundlePath = fileURLToPath(new URL('../.cloudflare/output/v0/workers/default/bundle/index.js', import.meta.url))
+
 test('Home Nav keeps login, revision checks and password changes with SQLite DO storage', async () => {
-  const bundle = await readFile(new URL('../.cloudflare/output/v0/workers/default/bundle/index.js', import.meta.url), 'utf8')
+  try {
+    await access(bundlePath)
+  } catch {
+    throw new Error(`Missing Worker build artifact at ${bundlePath}. Run "npm run build" before "npm run test:worker".`)
+  }
+  const bundle = await readFile(bundlePath, 'utf8')
   const origin = 'https://home-nav.test'
   const mf = new Miniflare({ logRequests: false, workers: [{
     config: {
