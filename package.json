@@ -9,7 +9,7 @@
     "deploy": "cf deploy",
     "check": "vue-tsc --noEmit",
     "test": "node --experimental-strip-types --test tests/*.test.ts && vitest run --config vitest.config.ts",
-    "test:worker": "node --test tests/worker-smoke.mjs"
+    "test:worker": "node --test tests/worker-smoke.mjs tests/worker-api.mjs"
   },
   "dependencies": {
     "@lucide/vue": "^1.74.0",
